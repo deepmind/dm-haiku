@@ -158,12 +158,17 @@ class LayerNorm(hk.Module):
           "Cannot pass `offset` at call time if `create_offset=True`.")
 
     axis = to_abs_axes(self.axis, inputs.ndim)
-    mean = jnp.mean(inputs, axis=axis, keepdims=True)
+    # Keep low-precision variance and normalization intermediates representable.
+    stats_inputs = inputs
+    if inputs.dtype in (jnp.float16, jnp.bfloat16):
+      stats_inputs = inputs.astype(jnp.float32)
+    mean = jnp.mean(stats_inputs, axis=axis, keepdims=True)
     if self.use_fast_variance:
-      mean_of_squares = jnp.mean(jnp.square(inputs), axis=axis, keepdims=True)
+      mean_of_squares = jnp.mean(
+          jnp.square(stats_inputs), axis=axis, keepdims=True)
       variance = mean_of_squares - jnp.square(mean)
     else:
-      variance = jnp.var(inputs, axis=axis, keepdims=True)
+      variance = jnp.var(stats_inputs, axis=axis, keepdims=True)
 
     if ((self.create_scale or self.create_offset) and
         not self._param_axis_passed_explicitly):
@@ -195,6 +200,13 @@ class LayerNorm(hk.Module):
     elif offset is None:
       offset = np.array(0., dtype=inputs.dtype)  # pyrefly: ignore[bad-assignment]
 
+    output_dtype = jnp.result_type(inputs, scale, offset)
+    if stats_inputs.dtype != inputs.dtype:
+      compute_dtype = (jnp.float32 if output_dtype in
+                       (jnp.float16, jnp.bfloat16) else output_dtype)
+      scale = jax.lax.convert_element_type(scale, compute_dtype)
+      offset = jax.lax.convert_element_type(offset, compute_dtype)
+
     if jax.config.jax_numpy_rank_promotion != "allow":
       # TODO(b/234327547): Explicit bcast triggers excessive mem usage on TPU.
       # We should remove the conditional (and always broadcast) when the
@@ -205,7 +217,10 @@ class LayerNorm(hk.Module):
 
     eps = jax.lax.convert_element_type(self.eps, variance.dtype)
     inv = scale * jax.lax.rsqrt(variance + eps)  # pyrefly: ignore[unsupported-operation]
-    return inv * (inputs - mean) + offset  # pyrefly: ignore[unsupported-operation]
+    output = inv * (stats_inputs - mean) + offset  # pyrefly: ignore[unsupported-operation]
+    if stats_inputs.dtype != inputs.dtype:
+      output = output.astype(output_dtype)
+    return output
 
 
 class InstanceNorm(LayerNorm):
