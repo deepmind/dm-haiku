@@ -255,6 +255,77 @@ class LayerNormTest(parameterized.TestCase):
     self.assertEqual(ln.params_dict()["layer_norm/scale"].shape, param_shape)
     self.assertEqual(ln.params_dict()["layer_norm/offset"].shape, param_shape)
 
+  @parameterized.product(
+      dtype=(jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64),
+      use_fast_variance=(False, True), use_jit=(False, True), affine=(False, True))
+  def test_large_finite_inputs(self, dtype, use_fast_variance, use_jit, affine):
+    def forward(x):
+      return layer_norm.LayerNorm(
+          -1, affine, affine, use_fast_variance=use_fast_variance)(x)
+
+    fwd = transform.transform(forward)
+    x = jnp.array([[1000., -1000., 0.]], dtype=dtype)
+    params = fwd.init(None, x)
+    apply = jax.jit(fwd.apply) if use_jit else fwd.apply
+    with jax.numpy_dtype_promotion("strict"):
+      actual = apply(params, None, x)
+    self.assertEqual(actual.dtype, x.dtype)
+    for param in jax.tree.leaves(params):
+      self.assertEqual(param.dtype, x.dtype)
+
+    # Independently evaluate LayerNorm and its weighted-sum derivative in f64.
+    reference_x = np.asarray(x, dtype=np.float64)
+    centered = reference_x - reference_x.mean(axis=-1, keepdims=True)
+    variance = np.mean(centered ** 2, axis=-1, keepdims=True)
+    denominator = np.sqrt(variance + 1e-5)
+    expected = centered / denominator
+    weights = np.array([1., 2., 4.])
+    expected_grad = ((weights - weights.mean()) / denominator - centered *
+                     np.mean(weights * centered, axis=-1, keepdims=True) /
+                     denominator ** 3)
+    tolerance = {
+        jnp.bfloat16: 2e-2, jnp.float16: 2e-3,
+        jnp.float32: 1e-6, jnp.float64: 1e-9}[dtype]
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=1e-5)
+    with jax.numpy_dtype_promotion("strict"):
+      actual_grad = jax.grad(
+          lambda inputs: jnp.sum(apply(params, None, inputs) *
+                                 jnp.asarray(weights, dtype=inputs.dtype)))(x)
+    np.testing.assert_allclose(
+        actual_grad, expected_grad, rtol=tolerance, atol=1e-5)
+    if affine:
+      with jax.numpy_dtype_promotion("strict"):
+        param_grad = jax.grad(
+            lambda p: jnp.sum(apply(p, None, x) *
+                              jnp.asarray(weights, dtype=x.dtype)))(params)
+      np.testing.assert_allclose(
+          param_grad["layer_norm"]["scale"], expected[0] * weights,
+          rtol=tolerance, atol=1e-5)
+      np.testing.assert_allclose(
+          param_grad["layer_norm"]["offset"], weights,
+          rtol=tolerance, atol=1e-5)
+
+  @parameterized.product(use_fast_variance=(False, True), use_jit=(False, True))
+  def test_large_inputs_external_float32_affine(
+      self, use_fast_variance, use_jit):
+    def forward(x, scale, offset):
+      return layer_norm.LayerNorm(
+          -1, False, False, use_fast_variance=use_fast_variance)(x, scale, offset)
+
+    fwd = transform.transform(forward)
+    x = jnp.array([[1000., -1000., 0.]], dtype=jnp.float16)
+    scale = jnp.array([2., 3., 4.], dtype=jnp.float32)
+    offset = jnp.array([1., 2., 3.], dtype=jnp.float32)
+    params = fwd.init(None, x, scale, offset)
+    apply = jax.jit(fwd.apply) if use_jit else fwd.apply
+    actual = apply(params, None, x, scale, offset)
+    self.assertEqual(actual.dtype, jnp.float32)
+    reference_x = np.asarray(x, dtype=np.float64)
+    expected = ((reference_x - reference_x.mean(axis=-1, keepdims=True)) /
+                np.sqrt(reference_x.var(axis=-1, keepdims=True) + 1e-5))
+    expected = expected * np.asarray(scale) + np.asarray(offset)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
   @staticmethod
   def _ln_f(axis, param_axis, create_scale=True, create_offset=True):
     def f(x):
