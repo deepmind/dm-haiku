@@ -785,6 +785,66 @@ class StatefulTest(parameterized.TestCase):
                                rtol=1e-4)
     np.testing.assert_allclose(y, iters, rtol=1e-4)
 
+  @parameterized.parameters(False, True)
+  def test_while_loop_condition_reads_current_state(self, jit):
+    def f(x):
+      base.get_state("count", (), x.dtype, init=jnp.zeros)
+      if transform.running_init():
+        return x
+
+      def cond(x):
+        return (x < 3) & (base.get_state("count") < 2)
+
+      def body(x):
+        base.set_state("count", base.get_state("count") + 1)
+        return x + 1
+
+      return stateful.while_loop(cond, body, x)
+
+    f = transform.transform_with_state(f)
+    x = jnp.array(0.25, dtype=jnp.float32)
+    params, state = f.init(None, x)
+    apply = jax.jit(f.apply) if jit else f.apply
+    y, state = apply(params, state, None, x)
+    self.assertEqual(y, 2.25)
+    self.assertEqual(state["~"]["count"], 2)
+
+  @parameterized.parameters(*it.product((False, True), (2.0, -2.0)))
+  def test_while_loop_preserves_condition_module_names(self, jit, body_initial):
+    class Scalar(module.Module):
+      """Reads a scalar parameter under a shared module basename."""
+
+      def __init__(self, initial):
+        super().__init__(name="reader")
+        self.initial = initial
+
+      def __call__(self):
+        return base.get_parameter(
+            "w", (), jnp.float32, init=initializers.Constant(self.initial))
+
+    def f(x):
+      def cond(val):
+        return (val[0] < 2) & (Scalar(-1.0)() < 0)
+
+      def body(val):
+        return val[0] + 1, val[1] + Scalar(body_initial)()
+
+      if transform.running_init():
+        cond((0, x))
+        return body((0, x))
+      return stateful.while_loop(cond, body, (jnp.array(0, jnp.int32), x))
+
+    f = transform.transform_with_state(f)
+    x = jnp.array(0.0, dtype=jnp.float32)
+    params, state = f.init(None, x)
+    self.assertEqual(params["reader"]["w"], -1.0)
+    self.assertEqual(params["reader_1"]["w"], body_initial)
+    apply = jax.jit(f.apply) if jit else f.apply
+    (iterations, y), state = apply(params, state, None, x)
+    self.assertEqual(iterations, 2)
+    self.assertEqual(y, 2 * body_initial)
+    self.assertEmpty(state)
+
   def test_eval_shape(self):
     def some_shape_changing_fun(x):
       return x[0, :]
