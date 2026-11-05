@@ -892,9 +892,11 @@ def while_loop(cond_fun, body_fun, init_val):
 
   @functools.wraps(cond_fun)
   def pure_cond_fun(val):
-    val, _ = val
+    val, state = val
     try:
-      with base.assert_state_unchanged():
+      with temporary_internal_state(state, share_python_state=True), \
+           base.push_jax_trace_level(), \
+           base.assert_state_unchanged():
         return cond_fun(val)
     except base.StateChangedError as e:
       # If we find a use case for updating state/using rng in `cond` we would
